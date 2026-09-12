@@ -1,32 +1,31 @@
 #!/usr/bin/env bash
-# stop.sh — tear down DeepSeek-V4.1-Flash SGLang on all 3 Sparks.
+# stop.sh — full teardown of DeepSeek-V4.1-Flash SGLang on all 3 Sparks.
 #
-# Stops:
+# Stops (safe order):
 #   - dsv41-head on spark1 (rank 0 + API :8888)
 #   - dsv41-worker on spark2 and spark3
+#   - worker docker volume dsv41-weights (its NFS mount is dropped)
+#   - the NFSv4 exporter (dsv41-nfs) — removed LAST, only after both workers
+#     are gone; stopping it while a worker still has it mounted wedges that
+#     worker's docker in a kernel hard-mount retry
 #   - log-tail helper
 #   - leftover sglang.launch_server in those containers
 #
 # Keeps:
 #   - checkpoint on spark1
 #   - overlay image dsv41-3x-spark:local
-#   - shared NFSv4 exporter (vllm-fn-nfs) — Qwen/GLM still use it
-#   - docker volume dsv41-weights unless you pass --unmount
 #
 # Usage:
-#   ./stop.sh              stop serve on all 3 nodes
-#   ./stop.sh --unmount    also drop worker NFS volumes (weights stay on spark1)
-#   ./start.sh stop        same
+#   ./stop.sh        stop everything on all 3 nodes
+#   ./start.sh stop  same
 #
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-UNMOUNT="${UNMOUNT:-0}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --unmount|-u) UNMOUNT=1 ;;
     -h|--help)
       sed -n '2,20p' "$0" | sed 's/^# \?//'
       exit 0
@@ -70,6 +69,7 @@ fi
 WORKER_USER="${WORKER_USER:-zurih}"
 SSH_IDENTITY="$(_abs "${SSH_IDENTITY:-$HOME/.ssh/id_ed25519_shared}")"
 NFS_VOLUME="${NFS_VOLUME:-dsv41-weights}"
+NFS_CONTAINER="${NFS_CONTAINER:-dsv41-nfs}"
 IMAGE="${IMAGE:-dsv41-3x-spark:local}"
 REMOTE_PY="${REMOTE_PY:-$ROOT/scripts/remote.py}"
 LOG_DIR="${LOG_DIR:-$ROOT/logs}"
@@ -118,12 +118,12 @@ pkill -f "docker logs -f ${HEAD_CTN}" >/dev/null 2>&1 || true
 info "head: SIGTERM sglang in $HEAD_CTN, then remove"
 _stop_sglang_in "$HEAD_CTN"
 _rm_ctn "$HEAD_CTN"
-# anything else this recipe named
-ids=$(docker ps -aq --filter "name=dsv41-" 2>/dev/null || true)
-if [[ -n "$ids" ]]; then
-  # shellcheck disable=SC2086
-  timeout "$RM_TIMEOUT" docker rm -f $ids >/dev/null 2>&1 || true
-fi
+# The NFS exporter (dsv41-nfs) is not touched here — it is removed at the very
+# end, after both workers are gone. Stopping it while a worker still has it
+# mounted wedges that worker's docker rm in a kernel hard-mount retry.
+timeout "$RM_TIMEOUT" docker rm -f "$HEAD_CTN" >/dev/null 2>&1 || true
+
+ALL_WORKERS_OK=1
 
 for h in "${WORKER_HOSTS[@]}"; do
   info "worker $WORKER_USER@$h: stop $WORKER_CTN"
@@ -135,20 +135,26 @@ for h in "${WORKER_HOSTS[@]}"; do
         pkill -KILL -f \"[s]glang.launch_server\" >/dev/null 2>&1 || true
       ' 2>/dev/null || true
     fi
-    timeout ${RM_TIMEOUT} docker rm -f $(printf '%q' "$WORKER_CTN") >/dev/null 2>&1 || docker rm -f $(printf '%q' "$WORKER_CTN") >/dev/null 2>&1 || true
-    ids=\$(docker ps -aq --filter name=dsv41- 2>/dev/null || true)
-    [ -n \"\$ids\" ] && docker rm -f \$ids >/dev/null 2>&1 || true
+    # One rm only, with a timeout. The old un-timed second attempt hung
+    # forever whenever the NFS exporter was already gone (hard-mount retry).
+    timeout ${RM_TIMEOUT} docker rm -f $(printf '%q' "$WORKER_CTN") >/dev/null 2>&1 || true
     echo STOPPED_$h
   " 2>/dev/null | grep -q "STOPPED_$h"; then
     info "  $h: container gone"
   else
     warn "  $h: SSH/docker cleanup failed (node unreachable?). GPU there may still be busy."
+    ALL_WORKERS_OK=0
   fi
-  if [[ "$UNMOUNT" == "1" ]]; then
-    info "  $h: drop NFS volume $NFS_VOLUME"
-    remote_on "$h" "docker volume rm $(printf '%q' "$NFS_VOLUME") >/dev/null 2>&1 || true" || true
-  fi
+  info "  $h: drop NFS volume $NFS_VOLUME"
+  remote_on "$h" "docker volume rm $(printf '%q' "$NFS_VOLUME") >/dev/null 2>&1 || true" || true
 done
+
+if [[ "$ALL_WORKERS_OK" == "1" ]]; then
+  info "head: stop NFS exporter $NFS_CONTAINER (last)"
+  timeout "$RM_TIMEOUT" docker rm -f "$NFS_CONTAINER" >/dev/null 2>&1 || true
+else
+  warn "worker cleanup incomplete — keeping $NFS_CONTAINER (stopping it now could wedge the remaining worker)"
+fi
 
 echo
 if curl -sf --max-time 2 "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1 \
@@ -165,6 +171,5 @@ else
   info "no dsv41-* containers on head"
 fi
 
-info "kept: spark1 weights, $IMAGE overlay, vllm-fn-nfs exporter"
-[[ "$UNMOUNT" == "1" ]] || info "worker NFS volume $NFS_VOLUME kept (./stop.sh --unmount to drop it)"
-info "start again with: ./start.sh"
+info "kept: spark1 weights, $IMAGE overlay"
+info "start again with: ./start.sh serve (auto-runs the NFS share step)"
