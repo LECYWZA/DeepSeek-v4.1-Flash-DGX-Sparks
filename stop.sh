@@ -150,8 +150,26 @@ for h in "${WORKER_HOSTS[@]}"; do
 done
 
 if [[ "$ALL_WORKERS_OK" == "1" ]]; then
-  info "head: stop NFS exporter $NFS_CONTAINER (last)"
-  timeout "$RM_TIMEOUT" docker rm -f "$NFS_CONTAINER" >/dev/null 2>&1 || true
+  if docker ps -a --format '{{.Names}}' | grep -qx "$NFS_CONTAINER"; then
+    info "head: stop NFS exporter $NFS_CONTAINER (last)"
+    # This is a privileged kernel-NFS server (nfsd + rpc_pipefs inside). dockerd
+    # sometimes fails to reap it on the first kill ("did not receive an exit
+    # event") and only gets the exit ~1-3 min later, so: unexport first, then
+    # retry the rm and give dockerd time instead of reporting a false failure.
+    timeout 10 docker exec "$NFS_CONTAINER" sh -c 'exportfs -au 2>/dev/null || true; rpc.nfsd 0 2>/dev/null || true' >/dev/null 2>&1 || true
+    _nfs_try=0
+    while (( _nfs_try < 6 )); do
+      _nfs_try=$((_nfs_try + 1))
+      if timeout "$RM_TIMEOUT" docker rm -f "$NFS_CONTAINER"; then
+        break
+      fi
+      warn "  rm attempt $_nfs_try/6 failed — waiting 10s, dockerd may still be reaping the container"
+      sleep 10
+    done
+    if docker ps -a --format '{{.Names}}' | grep -qx "$NFS_CONTAINER"; then
+      warn "$NFS_CONTAINER is STILL present — run: docker rm -f $NFS_CONTAINER (allow a minute), or restart docker"
+    fi
+  fi
 else
   warn "worker cleanup incomplete — keeping $NFS_CONTAINER (stopping it now could wedge the remaining worker)"
 fi
