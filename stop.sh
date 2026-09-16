@@ -109,6 +109,13 @@ _stop_sglang_in() {
 
 info "=== stop DeepSeek-V4.1-Flash (3× Spark SGLang) ==="
 
+# Optional memory guard (experiment add-on, scripts/verify/memguard.py): stop it
+# so it never outlives the server.
+if systemctl is-active --quiet dsv41-memguard 2>/dev/null; then
+  info "memguard: stopping dsv41-memguard"
+  systemctl stop dsv41-memguard 2>/dev/null || true
+fi
+
 if [[ -f "$LOG_DIR/logtail.pid" ]]; then
   kill "$(cat "$LOG_DIR/logtail.pid")" 2>/dev/null || true
   rm -f "$LOG_DIR/logtail.pid"
