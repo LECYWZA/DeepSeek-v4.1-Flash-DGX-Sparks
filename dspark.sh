@@ -63,6 +63,13 @@ while true; do
     3) ./start.sh share; pause ;;
     4) ./start.sh pack; pause ;;
     5) echo "提示: 启动约30分钟; 中途 Ctrl+C 只退出日志显示, 容器会继续启动; 停止服务请用菜单 9)"; echo
+       read -r -p "是否开启内存守护 dsv41-memguard（长上下文防爆，默认关）？[y/N]: " mg
+       if [[ "$mg" =~ ^[Yy]$ ]]; then
+         export DSV41_MEMGUARD_GB="${DSV41_MEMGUARD_GB:-1.5}"
+         echo "内存守护: 开（随服务启动; 停止服务时自动关闭; 阈值 ${DSV41_MEMGUARD_GB} GB）"
+       else
+         echo "内存守护: 关"
+       fi
        ./start.sh serve; pause ;;
     6) ./start.sh status; pause ;;
     7) ./start.sh logs; pause ;;

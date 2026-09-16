@@ -741,6 +741,16 @@ $(worker_env_lines "$wip" "$wgid" "$rank")
       ( setsid docker logs -f --since 1s "$HEAD_CTN" >>"$SERVE_LOG" 2>&1 </dev/null & ) 2>/dev/null
       echo
       info "API is up on :$PORT (smoke + warm-up passed) — engine keeps running, this script is done."
+      if [[ -n "${DSV41_MEMGUARD_GB:-}" && "${DSV41_MEMGUARD_GB}" != "0" ]]; then
+        if systemctl is-active --quiet dsv41-memguard 2>/dev/null; then
+          info "memguard: already running (dsv41-memguard)"
+        else
+          info "memguard: starting dsv41-memguard (abort all below ${DSV41_MEMGUARD_GB} GB free), log: $LOG_DIR/memguard.log"
+          systemd-run --no-block --unit=dsv41-memguard --working-directory="$ROOT" \
+            bash -c "python3 scripts/verify/memguard.py $LOG_DIR/memguard.log ${DSV41_MEMGUARD_GB}" \
+            >/dev/null 2>&1 || warn "memguard: failed to start (systemctl status dsv41-memguard)"
+        fi
+      fi
       cmd_status
       echo
       echo "  curl http://$HEAD_IP:$PORT/v1/chat/completions \\"
