@@ -566,17 +566,23 @@ cmd_prepare_ablit() {
   local sidecar="$DSV41_ABLIT_SIDECAR"
   if [[ ! -f "$sidecar/wo_b_l10_35.safetensors" ]]; then
     local hf_endpoint="${HF_ENDPOINT:-https://hf-mirror.com}"
+    # The sidecar repo is gated: pass a token (env, or ~/.cache/huggingface/token).
+    local hf_token="${HF_TOKEN:-}"
+    if [[ -z "$hf_token" && -f "$HOME/.cache/huggingface/token" ]]; then
+      hf_token="$(cat "$HOME/.cache/huggingface/token")"
+    fi
     info "downloading ablit sidecar ($ABLIT_HF_REPO) via $hf_endpoint"
     mkdir -p "$sidecar"
     if command -v hf >/dev/null 2>&1; then
-      HF_ENDPOINT="$hf_endpoint" hf download "$ABLIT_HF_REPO" \
+      HF_TOKEN="$hf_token" HF_ENDPOINT="$hf_endpoint" hf download "$ABLIT_HF_REPO" \
         --include 'wo_b_l10_35.safetensors' --include 'apply_wo_b_graft.py' \
         --local-dir "$sidecar"
     else
-      docker run --rm --network host -e "HF_ENDPOINT=$hf_endpoint" \
+      docker run --rm --network host \
+        -e "HF_TOKEN=$hf_token" -e "HF_ENDPOINT=$hf_endpoint" \
         -v "$sidecar:/sidecar" --entrypoint python3 "$IMAGE" \
         -c "from huggingface_hub import snapshot_download; snapshot_download('$ABLIT_HF_REPO', local_dir='/sidecar', allow_patterns=['wo_b_l10_35.safetensors','apply_wo_b_graft.py'])" \
-        || die "ablit sidecar download failed (HF_ENDPOINT=$hf_endpoint)"
+        || die "ablit sidecar download failed (HF_ENDPOINT=$hf_endpoint; gated repo needs HF_TOKEN)"
     fi
     [[ -f "$sidecar/wo_b_l10_35.safetensors" ]] || die "sidecar still missing after download: $sidecar"
   fi
