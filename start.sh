@@ -353,6 +353,11 @@ docker_common_args() {
   fi
   if [[ -f "$NCCL_HOST_DIR/libnccl.so.2.30.7" || -f "$NCCL_HOST_DIR/libnccl.so.2" ]]; then
     _a+=(-v "$NCCL_HOST_DIR:$NCCL_CONTAINER_DIR:ro" -e "LD_LIBRARY_PATH=$NCCL_CONTAINER_DIR")
+    # ringonly patched NCCL: preload over the image copy; NCCL_RINGONLY=1 tells it
+    # to skip the tree/PAT graph connects (those cross non-adjacent ranks on a ring).
+    if [[ "${NCCL_RINGONLY:-0}" == "1" ]]; then
+      _a+=(-e "LD_PRELOAD=$NCCL_CONTAINER_DIR/libnccl.so.2" -e "NCCL_RINGONLY=1")
+    fi
   fi
 }
 
@@ -750,6 +755,9 @@ cmd_serve() {
       if [ -f \$HOME/nccl-2.30.7/libnccl.so.2.30.7 ]; then
         NCCL_VOL=\"-v \$HOME/nccl-2.30.7:$NCCL_CONTAINER_DIR:ro\"
         NCCL_ENV='-e LD_LIBRARY_PATH=$NCCL_CONTAINER_DIR'
+        if [ "${NCCL_RINGONLY:-0}" = "1" ]; then
+          NCCL_ENV=\"\$NCCL_ENV -e LD_PRELOAD=$NCCL_CONTAINER_DIR/libnccl.so.2 -e NCCL_RINGONLY=1\"
+        fi
       fi
       docker run -d --name $WORKER_CTN \
         --network host --ipc host --privileged --cap-add IPC_LOCK --gpus all \
