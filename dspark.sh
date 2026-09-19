@@ -1,60 +1,57 @@
 #!/bin/bash
-# dspark.sh — DeepSeek-V4.1-Flash (3x/4x Spark) 控制台菜单
+# dspark.sh — DeepSeek-V4.1-Flash (4× Spark / TP4) 控制台菜单
 #
 # 用法（必须在本目录执行）:
-#   cd <repo> && ./dspark.sh              # TP3 (start.sh / .env)
-#   cd <repo> && ./dspark.sh --tp4        # TP4 (start-tp4.sh / .env.tp4)
+#   cd <repo> && ./dspark.sh              # 菜单（TP4: start-tp4.sh / .env.tp4）
+#   cd <repo> && ./dspark.sh <子命令> ...  # 直通（推荐）:
+#     ./dspark.sh doctor|build|share|pack|serve|stop|status|logs|smoke|prepare [参数...]
+#   例: ./dspark.sh serve      ./dspark.sh logs -f      ./dspark.sh stop
+#   --tp4 为兼容参数（可省略）；TP3 已弃用（--tp3 会明确拒绝）
 #   输入数字选择，q 退出；每个操作结束会提示"按回车返回菜单"
-#
-# 直通模式（不加 --tp4 则走 TP3）:
-#   ./dspark.sh --tp4 doctor|build|share|pack|serve|stop|status|logs|smoke|prepare [参数...]
-#   例: ./dspark.sh --tp4 serve      ./dspark.sh --tp4 logs -f      ./dspark.sh --tp4 stop
 #
 # 菜单项:
 #   1) doctor  环境自检（GPU/SSH/镜像/权重/NFS 是否就绪）
-#   2) build   构建 Engram overlay 镜像（dsv41-{3x,4x}-spark:local）
+#   2) build   构建 Engram overlay 镜像（dsv41-4x-spark:local）
 #   3) share   在 head 导出权重 NFSv4，给 worker 挂载（自动制备 ablit 变体）
 #   4) pack    Engram 分片重打包到各机本地 NVMe（首次约 10 分钟）
 #   5) serve   启动服务（前台日志；冷启 10-30 分钟到 Ready；Ctrl+C 只退日志）
 #   6) status  查看各机容器与 API 状态
-#   7) logs    看 head 日志尾部（./start.sh logs worker1 可看 worker）
+#   7) logs    看 head 日志尾部（./start-tp4.sh logs worker1 可看 worker）
 #   8) logs -f 跟随日志（Ctrl+C 只退出跟随，不影响服务）
-#   9) stop    停止一切：head/worker + worker 的 NFS 卷 + dsv41-nfs 全停
+#   9) stop    停止 head/worker 容器（保留权重 NFS 卷与 exporter）
 #   a)         模型变体切换（ablit=default / native）
-#   p)         制备 ablit 权重（./start.sh[-tp4].sh prepare，幂等）
+#   p)         制备 ablit 权重（./start-tp4.sh prepare，幂等）
 #   i)         一键初始化：doctor → build → share → pack
 #
 # 场景速查（什么情况跑哪几步）:
 #   * 全新机器/环境大变动 ...... i → 5 → 6 验证
-#   * 日常启动（服务已停） ...... 5（会自动补 share + abl 制备）→ 6
-#   * 改了 .env/.env.tp4 ........ 9（全停）→ 5（重启生效）
+#   * 日常启动（服务已停） ...... 5（会自动补 share + ablit 制备）→ 6
+#   * 改了 .env.tp4 ............. 9（全停）→ 5（重启生效）
 #   * 只动了权重或 NFS 配置 ..... 3 → 5
 #   * 改了 adapter/ 代码 ........ 2（重建镜像）→ 9 → 5
 #   * 服务异常/卡死 ............. 6 看状态 → 7/8 看日志 → 9 → 5 拉起
 #   * 日常体检/看日志 ........... 1 / 6 / 7
-#   * 完全停机/检修 ............. 9（全停；下次 5 会自动重建 NFS+卷）
+#   * 完全停机/检修 ............. 9（全停；下次 5 会自动复用/重建 NFS+卷）
 #
 # 备注:
-#   - 9) 为"全停"（不含权重/镜像）；重启走 5) 即可，无需先 3)
-#   - 各参数含义见 .env.example / .env.tp4.example；部署细节见 README.md 与 docs/
-#   - 控制脚本实体: start.sh (TP3) / start-tp4.sh (TP4)；本菜单只是包装
+#   - 9) 为"全停"（不含权重/镜像/exporter）；重启走 5) 即可，无需先 3)
+#   - 各参数含义见 .env.tp4.example；部署细节见 README.md 与 docs/
+#   - 控制脚本实体: start-tp4.sh；本菜单只是包装
 cd "$(dirname "$0")" || exit 1
 
-PROFILE="tp3"
-if [[ "${1:-}" == "--tp4" || "${DSPARK_PROFILE:-tp3}" == "tp4" ]]; then
-  PROFILE="tp4"
+if [[ "${1:-}" == "--tp3" ]]; then
+  echo "TP3 已弃用（本机现为 4×Spark/TP4）：请使用 ./start-tp4.sh（或直接 ./start.sh）操作。" >&2
+  exit 1
 fi
-LAUNCH() {
-  if [[ "$PROFILE" == "tp4" ]]; then ./start-tp4.sh "$@"; else ./start.sh "$@"; fi
-}
-# 直通模式: ./dspark.sh [--tp4] <子命令> [参数...] → 直接转发给 start[-tp4].sh
 if [[ "${1:-}" == "--tp4" ]]; then shift; fi
+LAUNCH() { ./start-tp4.sh "$@"; }
+
+# 直通模式: ./dspark.sh <子命令> [参数...] → 直接转发给 start-tp4.sh
 if (( $# > 0 )); then
   LAUNCH "$@"
   exit $?
 fi
-ENV_FILE=".env"
-if [[ "$PROFILE" == "tp4" ]]; then ENV_FILE=".env.tp4"; fi
+ENV_FILE=".env.tp4"
 [[ -f "$ENV_FILE" ]] || { echo "[!] $ENV_FILE 不存在 — 复制示例: cp $ENV_FILE.example $ENV_FILE"; }
 : > /tmp/dspark-env-$$.sh; i=0
 while IFS= read -r line; do
@@ -83,8 +80,8 @@ pause() { echo; read -r -p "按回车返回菜单..." _; }
 while true; do
   clear
   echo "=================================================="
-  echo "     DeepSeek-V4.1-Flash ($( [[ "$PROFILE" == tp4 ]] && echo 4x || echo 3x )x Spark 控制台)"
-  echo "      profile=${PROFILE}   model_variant=${VARIANT:-$(grep -E '^DSV41_MODEL_VARIANT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 || echo ablit)}"
+  echo "     DeepSeek-V4.1-Flash (4x Spark 控制台)"
+  echo "      profile=tp4   model_variant=${VARIANT:-$(grep -E '^DSV41_MODEL_VARIANT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 || echo ablit)}"
   echo "=================================================="
   echo "  1) 环境自检        doctor"
   echo "  2) 构建镜像        build"
