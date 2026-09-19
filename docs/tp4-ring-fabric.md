@@ -1,53 +1,60 @@
 # TP4 无交换机环状部署（4× DGX Spark · Ring · NFS from head）
 
-本集群 4 台 DGX Spark（spark-1/2/3/4），**无 RoCE 交换机**，每台仅有 2 个 ConnectX-7
-200G 口。TP=4 下的唯一连通拓扑是**环（ring）**：head→w1→w2→w3→head。本文给出
-接线、IP、NFS 与运维约定。**先读 README（上游 TP4 profile 说明）与 .env.tp4.example。**
+本集群 4 台 DGX Spark（spark-1/2/3/4），**无 RoCE 交换机**，每台 2 个 ConnectX-7
+物理口。TP=4 下的唯一连通拓扑是**环（ring）**：head→w2→w3→w4→head。本文给出
+接线、IP、NFS 与运维约定（2026-09-19 实测落地的方案）。**先读 README 与 .env.tp4.example。**
 
-> 注意：spark-4 为新机，接入前确认已安装 ConnectX-7 模块（`lspci | grep -i mellanox`
-> 有输出、`ls /sys/class/infiniband` 非空）。没装 RDMA 卡时只能走 2.5G 管理口，环上
-> NCCL 会被拖垮（88 次 all-reduce/步全部要经以太网）。
+> 注意：每台 Spark 的每个 QSFP 物理笼在系统里呈现 **2 个 netdev**（同一 index 的
+> `enp1s0f*n*` 与 `enP2p1s0f*n*` 处在同一二层域，实测 LLDP 互见）。接线以
+> `enp1s0f0np0 / enp1s0f1np1`（卡 A）为准即可，另一组 netdev 留 `optional: true`。
 
-## 1. 拓扑与 IP 规划（模板，按实际接线调整）
+## 1. 拓扑与 IP 规划（2026-09-19 实际接线）
 
 ```
-          rocep1s0f1np1                     rocep1s0f0np0
-   ┌──────────────┐  192.168.100.1/24   ┌──────────────┐  192.168.104.1/24  ┌──────────────┐
-   │  spark-1     │◄──────────────────►│  spark-4     │◄──────────────────►│  spark-1     │
-   │  (HEAD)      │     400G 直连        │  (ring node) │     400G 直连        │              │
-   └──────────────┘                    └──────────────┘                    └──────────────┘
-          │ 192.168.100.2/24                                                   ▲
-          │                                                                   │ 192.168.103.3/24
-          ▼                                                                   │
-   ┌──────────────┐  192.168.102.2/24   ┌──────────────┐  192.168.103.4/24
-   │  spark-2     │◄──────────────────►│  spark-3     │
-   └──────────────┘                    └──────────────┘
+        S1 (HEAD) ──100.1  ⇄  100.2──  S2 ──102.2 ⇄ 102.3── S3
+          │               (A1)    (A1)   (A0)   (A0)      │
+          │ 101.1                                          │ 103.3
+          │ (A0)                                           │ (A1)
+          └──────────────⇄ S4 ⇄───────────────────────────┘
+                   101.4 (A0)      103.4 (A1)
 ```
 
-- 每条 200G 直连独立子网（/24），每台用 2 口、每口只连一个邻居，形成
-  `S1(100.1)–S2(100.2)`、`S2(102.2)–S3(102.3)`、`S3(103.3)–S4(103.4)`、`S4(104.4)–S1(104.1)`。
-- **环上只有 S2、S4 与 head 直连**；S3 与 head 相距两跳（经 S4 或 S2）。推理不受影响
-  （NCCL RING 只做相邻通信），**NFS（加载期）**需要 S3 能到达 head —— 见 §3。
-- 管理面：spark-1 `192.168.1.153` / spark-2 `.118` / spark-3 `.128` / spark-4 `.196`
-  （`GLOO_SOCKET_IFNAME=enP7s7`，仅 bootstrap 与 SSH 用）。
+| 链路 | 端 A | 端 B | 网段 |
+|---|---|---|---|
+| S1↔S2 | S1 `enp1s0f1np1` = 192.168.100.1/24 | S2 `enp1s0f1np1` = 192.168.100.2/24 | 100 |
+| S2↔S3 | S2 `enp1s0f0np0` = 192.168.102.2/24 | S3 `enp1s0f0np0` = 192.168.102.3/24 | 102 |
+| S3↔S4 | S3 `enp1s0f1np1` = 192.168.103.3/24 | S4 `enp1s0f1np1` = 192.168.103.4/24 | 103 |
+| S4↔S1 | S4 `enp1s0f0np0` = 192.168.101.4/24 | S1 `enp1s0f0np0` = 192.168.101.1/24 | 101 |
+
+- 每条 200G 直连独立 /24，全部 `mtu 9000`，持久化在每台 `/etc/netplan/01-qsfp.yaml`。
+- **环上只有 S2、S4 与 head 直连**；S3 与 head 相距两跳（经 S4）。NCCL RING 只做
+  相邻通信，数据面不受影响；**NFS（加载期）**需要 S3 能到达 head —— 见 §3。
+- 管理面：spark-1 `192.168.123.103` / spark-2 `.109` / spark-3 `.232` / spark-4 `.65`
+  （Gloo/TCPStore 与 SSH 全部走管理面；SSH 免密仅需 head→各 worker）。
 
 ## 2. .env.tp4 关键项（与环网对应）
 
 ```bash
-HEAD_IP=192.168.100.1                        # rank0，API+NFS（head 对 S2 的口）
-WORKER_IPS="192.168.100.2 192.168.102.3 192.168.103.4"
-WORKER_HOSTS="spark2 spark3 spark4"
-FABRIC_IFACE=enp1s0f1np1
+# rank0 = HEAD_IP；Gloo/TCPStore 要求全员可达 → 用管理面（与 TP3 验证一致）
+HEAD_IP=192.168.123.103
+WORKER_IPS="192.168.123.109 192.168.123.232 192.168.123.65"   # 管理面
+WORKER_HOSTS="192.168.123.109 192.168.123.232 192.168.123.65" # SSH
+WORKER_USER=root
+SSH_IDENTITY=$HOME/.ssh/id_ed25519
+WORKER_DIR=/root/dsv41-4x-spark
+FABRIC_IFACE=enp1s0f0np0
 GLOO_SOCKET_IFNAME=enP7s7
 NCCL_SOCKET_IFNAME=enP7s7
 IB_HCA=rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1   # GB10 全部 4 个 RoCE 设备
 NCCL_ALGO=RING                                 # 显式锁定 ring（默认同值）
-NCCL_IB_GID_INDEX=3                            # 关键：对端断电会导致 GID 全零
+NCCL_IB_GID_INDEX=3                            # 对端断电会导致 GID 全零
 NCCL_NET_PLUGIN=none
 NCCL_TUNER_THRESHOLD=40960
-# NFS 路径（见 §3）：
-NFS_SERVER_IPS="192.168.100.1 192.168.104.1 192.168.104.1"
-NFS_CLIENTS=192.168.100.0/24,192.168.101.0/24,192.168.102.0/24,192.168.103.0/24,192.168.104.0/24
+# NFS 路径（见 §3，按 WORKER_IPS 顺序每 worker 一个 head 地址）：
+NFS_SERVER_IPS="192.168.100.1 192.168.101.1 192.168.101.1"
+NFS_CLIENTS=192.168.100.0/24,192.168.101.0/24,192.168.102.0/24,192.168.103.0/24,192.168.123.0/24
+NCCL_HOST_DIR=/usr/local/lib                   # head 侧 host NCCL 2.30.7
+READY_TIMEOUT=1200                             # 首次加载给足 20 分钟
 ```
 
 - `DSV41_MODEL_VARIANT=ablit`（默认）→ head 上先经 `./start-tp4.sh prepare` 生成
@@ -59,56 +66,57 @@ NFS_CLIENTS=192.168.100.0/24,192.168.101.0/24,192.168.102.0/24,192.168.103.0/24,
 
 Mia 默认：head 导出 `$MODEL_DIR`（选 ablit 时导出 ablit 目录），worker 用
 `NFS_SERVER_IPS`（每 worker 一个 head 地址）创建 `dsv41-weights` 卷挂载。
-环上：
+环上（2026-09-19 实测全部通过）：
 
 - **S2**：直连 head（100.1），挂 `192.168.100.1`（快）。
-- **S4**：直连 head（104.1），挂 `192.168.104.1`（快）。
-- **S3**：与 head 两跳，需要桥接。**方案 A（一次配置，永久生效）**：让 S4 作为
-  S3↔head 的桥（S4 同时持有 103.4 与 104.4 两个网段，天然中转）：
+- **S4**：直连 head（101.1），挂 `192.168.101.1`（快）。
+- **S3**：与 head 两跳，经 **S4 桥接**（S4 同时持有 103.4 与 101.4）：
   ```bash
-  # 在 spark-4（桥接节点）：
-  sysctl -w net.ipv4.ip_forward=1
-  # 在 spark-3（两跳节点）：
-  ip route add 192.168.104.0/24 via 192.168.103.4
+  # spark-4（桥节点）：
+  sysctl -w net.ipv4.ip_forward=1                      # + /etc/sysctl.d/99-dsv41-forward.conf
+  # 关键：docker 把 FORWARD policy 置 DROP，必须放行两 RoCE 口互转（已持久化 dsv41-forward.service）：
+  iptables -I DOCKER-USER 1 -i enp1s0f1np1 -o enp1s0f0np0 -j ACCEPT
+  iptables -I DOCKER-USER 1 -i enp1s0f0np0 -o enp1s0f1np1 -j ACCEPT
+  # spark-3（两跳节点）+ spark-1（回程）：静态路由，已写入各自 01-qsfp.yaml
+  #   spark-3: ip route add 192.168.101.0/24 via 192.168.103.4
+  #   spark-1: ip route add 192.168.103.0/24 via 192.168.101.4   ← 回程（易漏！）
   ```
-  之后 S3 挂 `192.168.104.1`（NFS TCP 经 S4 转发；速度比直连略低但远快于管理面）。
-- 兜底：S3 临时改挂管理面 `192.168.1.153`（千兆，476G 加载 ≈1h，仅启动期）。
-- **权重本地化备选**（若想彻底绕开 NFS）：`NFS_SHARE=0` + 每机本地放模型
-  （`rsync` 从 spark-2 的 HF 缓存或 head 的 `/models` 副本，走管理面或相邻 200G 口）。
+  之后 S3 挂 `192.168.101.1`（NFS TCP 经 S4 转发；实测挂载/读 config.json 正常）。
+- 兜底：S3 临时改挂管理面 `192.168.123.103`（千兆，476G 加载 ≈1h，仅启动期）。
 
 ## 4. GID 预检（每次起服前，尤其断电/重启后）
 
 对端断电会把 RoCE 的 GID 清成全零，NCCL 表现为 `ibv_modify_qp errno 61`（**不是** NCCL
-或驱动故障）。检查每台 `cat /sys/class/infiniband/rocep1s0f1/ports/1/gids/3` 应为
-`fe80::...<本机对口 IP>` 非全零；`./start-tp4.sh doctor` 已内置 HCA/GID/端口检查。
+或驱动故障）。检查每个带 IP 的口：
+`cat /sys/class/infiniband/rocep1s0f0/ports/1/gids/3` 应为 `::ffff:<本机对口 IP>` 非全零
+（2026-09-19 实测：S1 `::ffff:192.168.101.1`、S3 `::ffff:192.168.103.3`、S4 `::ffff:192.168.101.4/103.4`）。
+修复：`nmcli device disconnect <if> && nmcli device connect <if>` 硬复位（reapply 无效）。
+`./start-tp4.sh doctor` 已内置 HCA/GID/端口检查。
 
-## 5. 镜像分发（spark-4 全新，**禁止 pull**）
+## 5. 镜像分发（新机/新版本，**禁止 pull**）
 
 ```bash
-# spark-1（head 侧，一次性）：
-docker tag dsv41-3x-spark:local dsv41-4x-spark:local        # 对齐 .env.tp4 的 IMAGE 名
-docker save dsv41-4x-spark:local -o /models/dsv41-4x-spark.tar   # ~33GB, 不动运行容器
-# 传输（管理面 2.5G 约 2-3 分钟；或等 S4 接入后走 200G 秒级）：
-rsync -avP /models/dsv41-4x-spark.tar root@192.168.1.196:/models/
-# spark-4：
-docker load -i /models/dsv41-4x-spark.tar
-docker images   # 校验 ID 与 spark-1 一致；失败严禁 `docker pull` 兜底（网络慢）
-rm /models/dsv41-4x-spark.tar
+# 任一已有目标镜像的节点（实测 spark-4，33.5GB / 约 4 分钟；dockerd 先在
+# /var/lib/docker/tmp/docker-export-* 暂存，随后 ~0.5GB/s 落盘）：
+docker save dsv41-4x-spark:local -o /root/dsv41-img.tar
+# 分发（head 有全部 worker 的 SSH 信任；走 200G 环网最快，实测 ~800MB/s）：
+scp /root/dsv41-img.tar root@<fabric-ip>:/root/
+ssh root@<host> "docker load -i /root/dsv41-img.tar && docker images dsv41-4x-spark:local && rm -f /root/dsv41-img.tar"
+# 校验 ID 一致（本集群应为 594bb1ac3983）；失败严禁 `docker pull` 兜底（网络慢）
 ```
 
-按需补分发：`eugr-gb10-nvfp4kv:a4q2`（keys 对照）、`dspark-vllm-gx10:ib-v2`
-（现役 V4 Flash，回滚用），同法 save/load。
+按需补分发：`eugr-gb10-nvfp4kv:a4q2`（keys 对照）、`dspark-vllm-gx10:ib-v2`（现役 V4
+Flash 回滚栈），同法 save/load。
 
-## 6. 一次完整上线顺序（线到后）
+## 6. 一次完整上线顺序（实测流程）
 
-1. 接线成环 + 按 §1 配 IP + **§3 静态路由** + 每台 `gid_preflight` 通过
-2. spark-4：docker 镜像 `load`（§5）+ 复刻本仓库（`git clone gitlab` 或 rsync）
-3. `./dspark.sh --tp4` → 1) doctor 全绿 → 2) build（head 已构建过可跳过，S4 用成品镜像）→
-   3) share → 4) pack（每机本地产 Engram 分片 ~48G）→ 5) serve → 6) status/7) logs
-4. 验收：`./start-tp4.sh smoke`（三选一）+ 1M needle（C4）+ decode/prefill 基准
-   （sparkDash 或手跑，注意 2000MHz 口径）
-5. 失败回滚：`./dspark.sh --tp4` 9) stop；现役 V4 Flash 栈在 `dgx-spark-deploy`
-   （`git checkout main` 即回稳，spark-1/2 两个容器仍在）。
+1. 接线成环 + 按 §1 配 IP + **§3 路由/转发** + 每台 GID 预检通过
+2. 镜像 save/load 分发（§5）→ worker `git clone` 仓库 + head 写 `.env.tp4`
+3. `./start-tp4.sh doctor` 全绿 → `./start-tp4.sh share`（NFS 卷 3 worker 全部可见）
+4. `./start-tp4.sh pack`（每机本地产 Engram 分片 ~48GiB；实测 head~2分钟/层）
+5. `./dspark.sh --tp4` 或 `./start-tp4.sh serve` → smoke → 1M needle(C4) → 基准
+6. 失败回滚：`./start-tp4.sh stop`；现役 V4 Flash 栈在 `dgx-spark-deploy`
+   （`git checkout main` 即回稳）
 
 ## 7. 已知注意事项（继承 LuZ0.4.5 / Mia 经验）
 
