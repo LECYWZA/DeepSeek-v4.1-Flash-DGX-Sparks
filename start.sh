@@ -551,11 +551,12 @@ cmd_prepare_ablit() {
     info "variant=native — nothing to prepare"
     return 0
   fi
-  if [[ -f "$DSV41_MODEL_DIR_ABLIT/config.json" ]]; then
-    local meta=""
-    meta=$(grep -o '"n_edited": [0-9]*' "$DSV41_MODEL_DIR_ABLIT/ABLIT_META.json" 2>/dev/null || true)
-    info "ablit checkpoint ready: $DSV41_MODEL_DIR_ABLIT (${meta:-no ABLIT_META})"
+  if [[ -f "$DSV41_MODEL_DIR_ABLIT/config.json" && -f "$DSV41_MODEL_DIR_ABLIT/ABLIT_META.json" ]]; then
+    info "ablit checkpoint ready: $DSV41_MODEL_DIR_ABLIT ($(grep -o '"n_edited": [0-9]*' "$DSV41_MODEL_DIR_ABLIT/ABLIT_META.json" 2>/dev/null || echo 'no meta'))"
     return 0
+  fi
+  if [[ -f "$DSV41_MODEL_DIR_ABLIT/config.json" ]]; then
+    info "ablit in progress/stale (no ABLIT_META yet) — re-running graft (idempotent)"
   fi
   if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     info "image missing ($IMAGE) — building first"
