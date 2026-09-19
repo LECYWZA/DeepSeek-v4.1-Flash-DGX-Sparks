@@ -78,6 +78,7 @@ NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-1}"
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 NCCL_HOST_DIR="${NCCL_HOST_DIR:-$HOME/nccl-2.30.7}"
 NCCL_CONTAINER_DIR="${NCCL_CONTAINER_DIR:-/nccl}"
+NCCL_TARGET_SO="${NCCL_TARGET_SO:-/opt/sglang/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2}"
 
 MODEL_DIR="${MODEL_DIR:-$HOME/NewModels/DeepSeek-V4.1-Flash}"
 COMMON_MODEL="${COMMON_MODEL:-/var/tmp/DeepSeek-V4.1-Flash}"
@@ -351,13 +352,11 @@ docker_common_args() {
   if [[ -n "${EXTRA_SGLANG_ARGS:-}" ]]; then
     _a+=(-e "EXTRA_SGLANG_ARGS=$EXTRA_SGLANG_ARGS")
   fi
-  if [[ -f "$NCCL_HOST_DIR/libnccl.so.2.30.7" || -f "$NCCL_HOST_DIR/libnccl.so.2" ]]; then
-    _a+=(-v "$NCCL_HOST_DIR:$NCCL_CONTAINER_DIR:ro" -e "LD_LIBRARY_PATH=$NCCL_CONTAINER_DIR")
-    # ringonly patched NCCL: preload over the image copy; NCCL_RINGONLY=1 tells it
-    # to skip the tree/PAT graph connects (those cross non-adjacent ranks on a ring).
-    if [[ "${NCCL_RINGONLY:-0}" == "1" ]]; then
-      _a+=(-e "LD_PRELOAD=$NCCL_CONTAINER_DIR/libnccl.so.2" -e "NCCL_RINGONLY=1")
-    fi
+  if [[ "${NCCL_RINGONLY:-0}" == "1" && -f "$NCCL_HOST_DIR/libnccl.so.2" ]]; then
+    # ringonly patched NCCL replaces the image's nvidia-nccl runtime in place:
+    # deep_ep asserts a single byte-identical NCCL runtime in the process, and
+    # torch + pynccl both resolve the nvidia-nccl pip file we mount over here.
+    _a+=(-v "$NCCL_HOST_DIR/libnccl.so.2:$NCCL_TARGET_SO:ro" -e "NCCL_RINGONLY=1")
   fi
 }
 
@@ -752,12 +751,9 @@ cmd_serve() {
       mkdir -p $WORKER_DIR/state $WORKER_DIR/logs
       NCCL_VOL=''
       NCCL_ENV=''
-      if [ -f \$HOME/nccl-2.30.7/libnccl.so.2.30.7 ]; then
-        NCCL_VOL=\"-v \$HOME/nccl-2.30.7:$NCCL_CONTAINER_DIR:ro\"
-        NCCL_ENV='-e LD_LIBRARY_PATH=$NCCL_CONTAINER_DIR'
-        if [ "${NCCL_RINGONLY:-0}" = "1" ]; then
-          NCCL_ENV=\"\$NCCL_ENV -e LD_PRELOAD=$NCCL_CONTAINER_DIR/libnccl.so.2 -e NCCL_RINGONLY=1\"
-        fi
+      if [ \"${NCCL_RINGONLY:-0}\" = \"1\" ] && [ -f \$HOME/nccl-2.30.7/libnccl.so.2.30.7 ]; then
+        NCCL_VOL=\"-v \$HOME/nccl-2.30.7/libnccl.so.2.30.7:$NCCL_TARGET_SO:ro\"
+        NCCL_ENV='-e NCCL_RINGONLY=1'
       fi
       docker run -d --name $WORKER_CTN \
         --network host --ipc host --privileged --cap-add IPC_LOCK --gpus all \
