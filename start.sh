@@ -134,8 +134,6 @@ MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-4}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-320000}"
 DSV41_PREFILL_EMPTY_CACHE_TOKENS="${DSV41_PREFILL_EMPTY_CACHE_TOKENS:-8192}"
-MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-16384}"
-EXTRA_SGLANG_ARGS="${EXTRA_SGLANG_ARGS:-} --max-prefill-tokens ${MAX_PREFILL_TOKENS}"
 SPEC_ALGO="${SPEC_ALGO:-DSPARK}"
 DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-3}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-v4.1-flash}"
@@ -164,11 +162,21 @@ NCCL_HOST_DIR="$(_abs "$NCCL_HOST_DIR")"
 # path /models/DeepSeek-V4.1-Flash stays fixed. MODEL_DIR is rebound to the
 # selected variant here, which the NFS export, worker mounts, doctor and smoke
 # all follow automatically.
-DSV41_MODEL_VARIANT="${DSV41_MODEL_VARIANT:-ablit}"
 DSV41_MODEL_DIR_NATIVE="${DSV41_MODEL_DIR_NATIVE:-$MODEL_DIR}"
 DSV41_MODEL_DIR_ABLIT="${DSV41_MODEL_DIR_ABLIT:-$HOME/NewModels/DeepSeek-V4.1-Flash-Abliterated}"
 DSV41_ABLIT_SIDECAR="${DSV41_ABLIT_SIDECAR:-$HOME/dsv41-wo-b-ablit}"
 ABLIT_HF_REPO="${ABLIT_HF_REPO:-drowzeys/DeepSeek-V4.1-Flash-Abliterated-Cybersecurity-Unleashed}"
+# Default variant is auto-detected so tooling and fixtures without
+# the grafted checkpoint behave like upstream; the fleet .env.tp4
+# sets DSV41_MODEL_VARIANT=ablit explicitly and cmd_prepare_ablit
+# builds it on first use.
+if [[ -z "${DSV41_MODEL_VARIANT:-}" ]]; then
+  if [[ -f "$DSV41_MODEL_DIR_ABLIT/ABLIT_META.json" ]]; then
+    DSV41_MODEL_VARIANT=ablit
+  else
+    DSV41_MODEL_VARIANT=native
+  fi
+fi
 case "$DSV41_MODEL_VARIANT" in
   ablit)  MODEL_DIR="$(_abs "$DSV41_MODEL_DIR_ABLIT")" ;;
   native) MODEL_DIR="$(_abs "$DSV41_MODEL_DIR_NATIVE")" ;;
@@ -330,10 +338,8 @@ docker_common_args() {
     -e "NCCL_P2P_DISABLE=$NCCL_P2P_DISABLE"
     -e "NCCL_SHM_DISABLE=$NCCL_SHM_DISABLE"
     -e "NCCL_CROSS_NIC=${NCCL_CROSS_NIC:-1}"
-    -e "NCCL_ALGO=${NCCL_ALGO:-RING}"
-    -e "NCCL_IB_MERGE_NICS=${NCCL_IB_MERGE_NICS:-1}"
+    -e "NCCL_IB_MERGE_NICS=${NCCL_IB_MERGE_NICS:-0}"
     -e "NCCL_IB_SUBNET_AWARE_ROUTING=${NCCL_IB_SUBNET_AWARE_ROUTING:-1}"
-    -e "NCCL_IB_SUBNET_PREFIX_LEN=${NCCL_IB_SUBNET_PREFIX_LEN:-24}"
     -e "NCCL_CUMEM_ENABLE=0"
     -e "NCCL_DEBUG=$NCCL_DEBUG"
     -e "NCCL_BUFFSIZE=${NCCL_BUFFSIZE:-4194304}"
