@@ -147,6 +147,25 @@ MODEL_DIR="$(_abs "$MODEL_DIR")"
 SSH_IDENTITY="$(_abs "$SSH_IDENTITY")"
 NCCL_HOST_DIR="$(_abs "$NCCL_HOST_DIR")"
 
+# ─── model variant: abliterated (uncensored) overlay vs native ────────────────
+# DSV41_MODEL_VARIANT=ablit|native (default ablit). The abliterated pack only
+# changes layers 10-35 attn.wo_b (Keys overlay, see files/apply_wo_b_graft.py
+# and cmd_prepare_ablit); experts, Engram tables, tokenizer and the rest are
+# byte-identical to native, so SGLang loads it unchanged and the container
+# path /models/DeepSeek-V4.1-Flash stays fixed. MODEL_DIR is rebound to the
+# selected variant here, which the NFS export, worker mounts, doctor and smoke
+# all follow automatically.
+DSV41_MODEL_VARIANT="${DSV41_MODEL_VARIANT:-ablit}"
+DSV41_MODEL_DIR_NATIVE="${DSV41_MODEL_DIR_NATIVE:-$MODEL_DIR}"
+DSV41_MODEL_DIR_ABLIT="${DSV41_MODEL_DIR_ABLIT:-$HOME/NewModels/DeepSeek-V4.1-Flash-Abliterated}"
+DSV41_ABLIT_SIDECAR="${DSV41_ABLIT_SIDECAR:-$HOME/dsv41-wo-b-ablit}"
+case "$DSV41_MODEL_VARIANT" in
+  ablit)  MODEL_DIR="$(_abs "$DSV41_MODEL_DIR_ABLIT")" ;;
+  native) MODEL_DIR="$(_abs "$DSV41_MODEL_DIR_NATIVE")" ;;
+  *) echo "DSV41_MODEL_VARIANT must be 'ablit' or 'native' (got '$DSV41_MODEL_VARIANT')" >&2
+     exit 1 ;;
+esac
+
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; NC=$'\033[0m'
 info() { echo "${GREEN}[+]${NC} $*"; }
 warn() { echo "${YELLOW}[!]${NC} $*"; }
@@ -507,18 +526,62 @@ cmd_doctor() {
 }
 
 cmd_download() {
-  info "=== download $HF_REPO @$HF_REVISION → $MODEL_DIR ==="
-  mkdir -p "$MODEL_DIR"
+  info "=== download $HF_REPO @$HF_REVISION → $DSV41_MODEL_DIR_NATIVE ==="
+  local dir="$DSV41_MODEL_DIR_NATIVE"
+  mkdir -p "$dir"
   local n
-  n=$(find "$MODEL_DIR" -maxdepth 1 -name 'model-*-of-*.safetensors' 2>/dev/null | wc -l | tr -d ' ')
-  if [[ -f "$MODEL_DIR/config.json" && "${n:-0}" -ge "$EXPECTED_SHARDS" ]]; then
+  n=$(find "$dir" -maxdepth 1 -name 'model-*-of-*.safetensors' 2>/dev/null | wc -l | tr -d ' ')
+  if [[ -f "$dir/config.json" && "${n:-0}" -ge "$EXPECTED_SHARDS" ]]; then
     info "checkpoint already present ($n safetensors) — skip"
   else
     command -v hf >/dev/null || die "hf CLI missing (pip install -U huggingface_hub[cli])"
-    hf download "$HF_REPO" --revision "$HF_REVISION" --local-dir "$MODEL_DIR"
+    hf download "$HF_REPO" --revision "$HF_REVISION" --local-dir "$dir"
   fi
-  ln -sfn "$MODEL_DIR" "$COMMON_MODEL"
-  info "head: $COMMON_MODEL → $MODEL_DIR"
+  ln -sfn "$DSV41_MODEL_DIR_NATIVE" "$COMMON_MODEL"
+  info "head: $COMMON_MODEL → $DSV41_MODEL_DIR_NATIVE"
+}
+
+# Prepare the abliterated checkpoint (idempotent): graft the Keys L10-35
+# attn.wo_b sidecar onto the native pack into a NEW directory. Everything else
+# is hardlinked, so it costs a few shards of disk, not a second 476 GiB.
+# Uses the serving image's python for torch/safetensors (no host deps).
+cmd_prepare_ablit() {
+  if [[ "$DSV41_MODEL_VARIANT" != "ablit" ]]; then
+    info "variant=native — nothing to prepare"
+    return 0
+  fi
+  if [[ -f "$DSV41_MODEL_DIR_ABLIT/config.json" ]]; then
+    local meta=""
+    meta=$(grep -o '"n_edited": [0-9]*' "$DSV41_MODEL_DIR_ABLIT/ABLIT_META.json" 2>/dev/null || true)
+    info "ablit checkpoint ready: $DSV41_MODEL_DIR_ABLIT (${meta:-no ABLIT_META})"
+    return 0
+  fi
+  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    info "image missing ($IMAGE) — building first"
+    cmd_build
+  fi
+  [[ -f "$DSV41_MODEL_DIR_NATIVE/config.json" ]] \
+    || die "native checkpoint missing: $DSV41_MODEL_DIR_NATIVE (run ./start.sh download, DSV41_MODEL_VARIANT=native, or ./start.sh doctor)"
+  local sidecar="$DSV41_ABLIT_SIDECAR"
+  if [[ ! -f "$sidecar/wo_b_l10_35.safetensors" ]]; then
+    command -v hf >/dev/null || die "hf CLI missing (pip install -U huggingface_hub[cli])"
+    local hf_endpoint="${HF_ENDPOINT:-https://hf-mirror.com}"
+    info "downloading ablit sidecar (drowzeys/DeepSeek-V4.1-Flash-Abliterated-Cybersecurity-Unleashed) via $hf_endpoint"
+    mkdir -p "$sidecar"
+    HF_ENDPOINT="$hf_endpoint" hf download drowzeys/DeepSeek-V4.1-Flash-Abliterated-Cybersecurity-Unleashed \
+      --include 'wo_b_l10_35.safetensors' --include 'apply_wo_b_graft.py' \
+      --local-dir "$sidecar" || die "ablit sidecar download failed (HF_ENDPOINT=$hf_endpoint)"
+  fi
+  info "grafting ablit L10-35 attn.wo_b: $DSV41_MODEL_DIR_NATIVE → $DSV41_MODEL_DIR_ABLIT"
+  docker run --rm --network none --entrypoint python3 \
+    -v "$DSV41_MODEL_DIR_NATIVE:/src:ro" \
+    -v "$DSV41_MODEL_DIR_ABLIT:/dst" \
+    -v "$sidecar:/ablit:ro" \
+    "$IMAGE" /ablit/apply_wo_b_graft.py \
+      --src /src --dst /dst --wo-b /ablit/wo_b_l10_35.safetensors
+  [[ -f "$DSV41_MODEL_DIR_ABLIT/config.json" ]] \
+    || die "graft finished but $DSV41_MODEL_DIR_ABLIT/config.json is missing?"
+  info "ablit checkpoint ready: $DSV41_MODEL_DIR_ABLIT"
 }
 
 cmd_pull() {
@@ -565,6 +628,9 @@ cmd_build() {
 
 cmd_share() {
   info "=== share spark1 checkpoint over NFSv4 on ConnectX ==="
+  if [[ "$DSV41_MODEL_VARIANT" == "ablit" ]]; then
+    cmd_prepare_ablit
+  fi
   [[ -f "$MODEL_DIR/config.json" ]] || die "no checkpoint — ./start.sh download"
   ln -sfn "$MODEL_DIR" "$COMMON_MODEL"
   ensure_ssh_keys
@@ -594,7 +660,11 @@ _busy_gpu() {
 
 cmd_serve() {
   DOCTOR_STRICT=0 cmd_doctor || true
-  [[ -f "$MODEL_DIR/config.json" ]] || cmd_download
+  [[ -f "$DSV41_MODEL_DIR_NATIVE/config.json" ]] || cmd_download
+  if [[ "$DSV41_MODEL_VARIANT" == "ablit" ]]; then
+    cmd_prepare_ablit
+  fi
+  [[ -f "$MODEL_DIR/config.json" ]] || die "checkpoint missing: $MODEL_DIR"
   ln -sfn "$MODEL_DIR" "$COMMON_MODEL"
 
   if _busy_gpu && [[ "${FORCE:-0}" != "1" ]]; then
@@ -862,6 +932,10 @@ shift || true
 # being an NFS round trip to the head. Idempotent: complete shards are skipped.
 cmd_pack() {
   local src
+  if [[ "$DSV41_MODEL_VARIANT" == "ablit" ]]; then
+    cmd_prepare_ablit
+  fi
+  [[ -f "$MODEL_DIR/config.json" ]] || die "checkpoint missing: $MODEL_DIR (./start.sh download | prepare)"
   src=$(model_src)
   info "packing Engram shards: head $ENGRAM_DIR, workers $WORKER_ENGRAM_DIR"
   mkdir -p "$ENGRAM_DIR"
@@ -894,6 +968,7 @@ case "$CMD" in
   build) cmd_build ;;
   pack) cmd_pack ;;
   download) cmd_download ;;
+  prepare|prepare-ablit) cmd_prepare_ablit ;;
   share|mount) cmd_share ;;
   sync) cmd_sync ;;
   stop) cmd_stop "$@" ;;
