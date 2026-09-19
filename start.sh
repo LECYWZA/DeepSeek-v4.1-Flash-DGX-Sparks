@@ -159,6 +159,7 @@ DSV41_MODEL_VARIANT="${DSV41_MODEL_VARIANT:-ablit}"
 DSV41_MODEL_DIR_NATIVE="${DSV41_MODEL_DIR_NATIVE:-$MODEL_DIR}"
 DSV41_MODEL_DIR_ABLIT="${DSV41_MODEL_DIR_ABLIT:-$HOME/NewModels/DeepSeek-V4.1-Flash-Abliterated}"
 DSV41_ABLIT_SIDECAR="${DSV41_ABLIT_SIDECAR:-$HOME/dsv41-wo-b-ablit}"
+ABLIT_HF_REPO="${ABLIT_HF_REPO:-drowzeys/DeepSeek-V4.1-Flash-Abliterated-Cybersecurity-Unleashed}"
 case "$DSV41_MODEL_VARIANT" in
   ablit)  MODEL_DIR="$(_abs "$DSV41_MODEL_DIR_ABLIT")" ;;
   native) MODEL_DIR="$(_abs "$DSV41_MODEL_DIR_NATIVE")" ;;
@@ -564,13 +565,20 @@ cmd_prepare_ablit() {
     || die "native checkpoint missing: $DSV41_MODEL_DIR_NATIVE (run ./start.sh download, DSV41_MODEL_VARIANT=native, or ./start.sh doctor)"
   local sidecar="$DSV41_ABLIT_SIDECAR"
   if [[ ! -f "$sidecar/wo_b_l10_35.safetensors" ]]; then
-    command -v hf >/dev/null || die "hf CLI missing (pip install -U huggingface_hub[cli])"
     local hf_endpoint="${HF_ENDPOINT:-https://hf-mirror.com}"
-    info "downloading ablit sidecar (drowzeys/DeepSeek-V4.1-Flash-Abliterated-Cybersecurity-Unleashed) via $hf_endpoint"
+    info "downloading ablit sidecar ($ABLIT_HF_REPO) via $hf_endpoint"
     mkdir -p "$sidecar"
-    HF_ENDPOINT="$hf_endpoint" hf download drowzeys/DeepSeek-V4.1-Flash-Abliterated-Cybersecurity-Unleashed \
-      --include 'wo_b_l10_35.safetensors' --include 'apply_wo_b_graft.py' \
-      --local-dir "$sidecar" || die "ablit sidecar download failed (HF_ENDPOINT=$hf_endpoint)"
+    if command -v hf >/dev/null 2>&1; then
+      HF_ENDPOINT="$hf_endpoint" hf download "$ABLIT_HF_REPO" \
+        --include 'wo_b_l10_35.safetensors' --include 'apply_wo_b_graft.py' \
+        --local-dir "$sidecar"
+    else
+      docker run --rm --network host -e "HF_ENDPOINT=$hf_endpoint" \
+        -v "$sidecar:/sidecar" --entrypoint python3 "$IMAGE" \
+        -c "from huggingface_hub import snapshot_download; snapshot_download('$ABLIT_HF_REPO', local_dir='/sidecar', allow_patterns=['wo_b_l10_35.safetensors','apply_wo_b_graft.py'])" \
+        || die "ablit sidecar download failed (HF_ENDPOINT=$hf_endpoint)"
+    fi
+    [[ -f "$sidecar/wo_b_l10_35.safetensors" ]] || die "sidecar still missing after download: $sidecar"
   fi
   info "grafting ablit L10-35 attn.wo_b: $DSV41_MODEL_DIR_NATIVE → $DSV41_MODEL_DIR_ABLIT"
   docker run --rm --network none --entrypoint python3 \
