@@ -46,6 +46,9 @@ class EngramLoader(importlib.abc.Loader):
         elif module.__name__ == 'sglang.srt.managers.schedule_batch':
             from loop_abort import install as install_loop_abort
             install_loop_abort(module)
+        elif module.__name__ == 'sglang.srt.layers.attention.deepseek_v4_backend':
+            from indexer_budget import install
+            install(module)
         else:
             # V4.1 ratio-1/2 indexers always call the FP4 DeepGEMM kernel.
             # SM120 needs its split-128 planner even when the legacy FP8
@@ -73,6 +76,7 @@ class EngramFinder(importlib.abc.MetaPathFinder):
                             'sglang.srt.entrypoints.openai.encoding_dsv41',
                             'sglang.srt.entrypoints.openai.serving_chat',
                             'sglang.srt.managers.schedule_batch',
+                            'sglang.srt.layers.attention.deepseek_v4_backend',
                             'sglang.srt.layers.attention.dsv4.metadata'):
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path)

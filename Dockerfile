@@ -16,7 +16,7 @@ RUN PYTHONPATH=/opt/dsv41/adapter python3 /opt/dsv41/tests/test_thinking_alias.p
 ENV PYTHONPATH=/opt/dsv41/adapter \
     MODEL_PATH=/models/DeepSeek-V4.1-Flash \
     STATE_PATH=/state OFFLOAD_MODE=nvme DSV41_CACHE_GIB=16
-EXPOSE 8888
+EXPOSE 8000 8888
 # -S: skip site (the adapter's sitecustomize imports the engine, which takes >10 s on a
 # busy head and marked the container unhealthy during long prefills); health needs stdlib only.
 HEALTHCHECK --interval=30s --timeout=30s --start-period=30m --retries=3 \

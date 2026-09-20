@@ -364,9 +364,19 @@ def serve():
         cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, start_new_session=True)
 
+    proxy = None
+    if NODE_RANK == 0:
+        proxy_port = os.environ.get('SESSION_PROXY_PORT', '').strip()
+        if proxy_port and proxy_port not in ('0', 'off', 'no'):
+            proxy = subprocess.Popen(
+                [sys.executable, '-u', '/opt/dsv41/scripts/session_proxy.py'],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, start_new_session=True)
+
     def stop(*_):
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
+        for child in (proxy, process):
+            if child is not None and child.poll() is None:
+                os.killpg(child.pid, signal.SIGTERM)
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
@@ -375,7 +385,13 @@ def serve():
         for line in process.stdout:
             print(line.replace(secret, '[REDACTED]') if secret else line, end='', flush=True)
 
+    def proxy_logs():
+        for line in proxy.stdout:
+            print('[proxy] ' + line, end='', flush=True)
+
     threading.Thread(target=logs, daemon=True).start()
+    if proxy is not None:
+        threading.Thread(target=proxy_logs, daemon=True).start()
     try:
         if NODE_RANK != 0:
             return process.wait()
@@ -395,6 +411,9 @@ def serve():
             print(f'Ready: API on port {PORT} (rank 0). Key is in {STATE}/api-key.', flush=True)
         else:
             print(f'Ready: API on port {PORT} (rank 0), no API key.', flush=True)
+        if proxy is not None:
+            print(f'Ready: session proxy on port {os.environ.get("SESSION_PROXY_PORT", "8888")} '
+                  f'(0.0.0.0) -> 127.0.0.1:{PORT}', flush=True)
         return process.wait()
     finally:
         stop()
