@@ -400,6 +400,7 @@ worker_env_lines() {
   local wip="$1" wgid="$2" rank="$3"
   local -a worker_args=(
     -e "NODE_RANK=$rank"
+    -e "TZ=Asia/Shanghai"
     -e "NNODES=$NNODES"
     -e "TP_SIZE=$TP_SIZE"
     -e "EP_SIZE=$EP_SIZE"
@@ -849,6 +850,7 @@ $(worker_env_lines "$wip" "$wgid" "$rank")
   head_cid=$(docker run -d --name "$HEAD_CTN" --restart=no \
     "${head_args[@]}" \
     -e NODE_RANK=0 \
+    -e TZ=Asia/Shanghai \
     -e SKIP_SMOKE="$SKIP_SMOKE" \
     -e SMOKE_QUICK="$SMOKE_QUICK" \
     "$IMAGE" run)
