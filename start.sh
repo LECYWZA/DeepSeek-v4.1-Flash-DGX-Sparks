@@ -826,7 +826,7 @@ cmd_serve() {
 $(nccl_worker_settings)
       nccl_args=()
       nccl_mount_args nccl_args
-      docker run -d --name $(printf '%q' "$WORKER_CTN") \
+      docker run -d --restart=unless-stopped --name $(printf '%q' "$WORKER_CTN") \
         --network host --ipc host --privileged --cap-add IPC_LOCK --gpus all \
         --shm-size $(printf '%q' "${SHM_SIZE:-32g}") \
         --ulimit memlock=-1:-1 --ulimit stack=67108864 \
@@ -847,7 +847,7 @@ $(worker_env_lines "$wip" "$wgid" "$rank")
   local -a head_args=()
   docker_common_args head_args "$HEAD_IP" "$GID_HEAD"
   local head_cid=""
-  head_cid=$(docker run -d --name "$HEAD_CTN" --restart=no \
+  head_cid=$(docker run -d --name "$HEAD_CTN" --restart=unless-stopped \
     "${head_args[@]}" \
     -e NODE_RANK=0 \
     -e TZ=Asia/Shanghai \
